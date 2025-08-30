@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import json
-import os
 from pathlib import Path
 
 import pandas as pd
@@ -28,18 +27,36 @@ st.markdown(
 st.markdown('<div class="rtl"><h1>📊 דשבורד נתוני נגב (2019)</h1></div>', unsafe_allow_html=True)
 st.markdown('<div class="rtl">ממשק אינפוגרפי ל־31 רשויות הנגב מתוך קובץ המקור. ניתן להשוות בין רשויות, לבחור מדדים ולייצא נתונים.</div>', unsafe_allow_html=True)
 
+# ---------- קבצים ----------
 DATA_FILE = Path(__file__).parent / "negev_data.json"
 AUTH_FILE = Path(__file__).parent / "negev_31_list.json"
 
+# ---------- עזר: ייחוד שמות עמודות ----------
+def make_unique_columns(cols):
+    seen = {}
+    out = []
+    for c in cols:
+        c = "" if c is None else str(c)
+        if c not in seen:
+            seen[c] = 1
+            out.append(c)
+        else:
+            seen[c] += 1
+            out.append(f"{c}__{seen[c]}")  # מוסיף סיומת לעמודות כפולות
+    return out
 
 # ---------- טעינת נתונים ----------
 @st.cache_data
 def load_data(data_path: Path):
     if not data_path.exists():
-        st.error(f"לא נמצא קובץ נתונים: {data_path.name}. העלה את negev_data.json לתיקייה של האפליקציה.")
+        st.error(f"לא נמצא קובץ נתונים: {data_path.name}. העלה/י את negev_data.json לתיקיית האפליקציה.")
         st.stop()
 
     df = pd.read_json(data_path)
+
+    # הבטחת ייחודיות בעמודות (מונע ValueError ב־pyarrow/Streamlit)
+    df.columns = make_unique_columns(df.columns)
+
     if "שם רשות" not in df.columns:
         st.error("קובץ הנתונים חייב לכלול עמודה בשם 'שם רשות'.")
         st.stop()
@@ -85,7 +102,6 @@ def load_data(data_path: Path):
 
     return df, numeric_cols
 
-
 @st.cache_data
 def load_authorities(auth_path: Path):
     if not auth_path.exists():
@@ -106,13 +122,13 @@ def load_authorities(auth_path: Path):
         except Exception:
             return []
 
-
 df, numeric_cols = load_data(DATA_FILE)
 negev31 = load_authorities(AUTH_FILE)
 
-# סינון ל-31 רשויות (אם קיימת הרשימה)
+# סינון ל־31 רשויות (אם קיימת הרשימה)
 df_negev = df[df["שם רשות"].isin(negev31)].copy() if negev31 else df.copy()
-
+# ייחודיות גם אחרי סינון
+df_negev.columns = make_unique_columns(df_negev.columns)
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -135,7 +151,7 @@ with st.sidebar:
     else:
         metric_options = list(numeric_cols)
 
-    # אם אין עמודות מספריות בכלל – נופלים חזרה לכל העמודות (מלבד שם רשות)
+    # אם אין עמודות מספריות כלל – fallback לכל העמודות (מלבד 'שם רשות')
     if not metric_options:
         metric_options = [c for c in df.columns if c != "שם רשות"]
 
@@ -155,11 +171,9 @@ with st.sidebar:
         mime="text/csv",
     )
 
-
 # ---------- KPI ----------
 st.markdown('<div class="rtl"><h2>מדדים מרכזיים</h2></div>', unsafe_allow_html=True)
 col1, col2, col3 = st.columns(3)
-
 
 def kpi(col, title, series):
     with col:
@@ -168,7 +182,6 @@ def kpi(col, title, series):
             st.metric(label=title, value=f"{val:,.2f}")
         except Exception:
             st.metric(label=title, value="—")
-
 
 if selected_metric in df_negev.columns:
     kpi(col1, f"ממוצע נגב – {selected_metric}", df_negev[selected_metric])
@@ -188,12 +201,12 @@ if selected_metric in df_negev.columns:
 else:
     st.info("המדד שנבחר לא קיים בנתונים. בחר/י מדד אחר או עדכן/ני את קובץ הנתונים.")
 
-
 # ---------- גרף השוואה ----------
 st.markdown('<div class="rtl"><h2>השוואת רשויות</h2></div>', unsafe_allow_html=True)
 if authorities:
     if selected_metric in df_negev.columns:
         cmp = df_negev[df_negev["שם רשות"].isin(authorities)][["שם רשות", selected_metric]].dropna()
+        cmp.columns = make_unique_columns(cmp.columns)  # הבטחת ייחודיות
         if not cmp.empty:
             fig = px.bar(cmp, x="שם רשות", y=selected_metric, text=selected_metric, title=f"השוואת {selected_metric}")
             fig.update_traces(texttemplate="%{text:.2f}", textposition="outside")
@@ -205,7 +218,6 @@ if authorities:
         st.warning("המדד שנבחר לא קיים בנתונים.")
 else:
     st.info("בחר/י עד 3 רשויות להשוואה בצד ימין.")
-
 
 # ---------- טבלת השוואה ----------
 st.markdown('<div class="rtl"><h2>טבלת השוואה</h2></div>', unsafe_allow_html=True)
@@ -219,7 +231,8 @@ else:
     if not available_cols:
         st.warning("לא נמצאו עמודות זמינות לטבלה. שנה/י את בחירת המדדים.")
     else:
-        table = df_negev[available_cols].dropna(subset=[selected_metric], how="all")
+        table = df_negev[available_cols].copy()
+        table.columns = make_unique_columns(table.columns)  # הבטחת ייחודיות לפני הצגה/ייצוא
         st.dataframe(table, use_container_width=True)
         st.download_button(
             "📥 הורדת טבלת השוואה (CSV)",
