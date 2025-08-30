@@ -23,7 +23,7 @@ st.markdown(
       .kpi h3 { font-size:1rem; margin:0 0 6px 0; }
       .kpi .val { font-size:1.4rem; font-weight:700; }
     </style>
-    """",
+    """,
     unsafe_allow_html=True,
 )
 
