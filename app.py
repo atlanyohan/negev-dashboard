@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import json, re
+import json, re, io
 from pathlib import Path
 
 import numpy as np
@@ -32,13 +32,10 @@ st.markdown('<div class="rtl"><h1>📊 דשבורד נגב (2019) — סקירה
 # ========================
 # File paths
 # ========================
-DATA_FILE = Path(__file__).parent / "negev_data.json"        # קובץ נתונים (JSON/NDJSON/CSV)
-AUTH_FILE = Path(__file__).parent / "negev_31_list.json"     # אופציונלי: 31 רשויות
-GEO_FILE_CANDIDATES = [
-    Path(__file__).parent / "negev_geo.json",
-    Path(__file__).parent / "israel_munis.geojson",
-    Path(__file__).parent / "israel_munis.json",
-]
+ROOT = Path(__file__).parent
+DATA_FILE = ROOT / "negev_data.json"        # ברירת מחדל (נטען גם CSV/Excel)
+AUTH_FILE = ROOT / "negev_31_list.json"     # אופציונלי: 31 רשויות
+GEO_FILE_CANDIDATES = [ROOT / "negev_geo.json", ROOT / "israel_munis.geojson", ROOT / "israel_munis.json"]
 
 # ========================
 # Helpers
@@ -61,24 +58,19 @@ def make_unique_columns(cols):
     return out
 
 def smart_split(label: str):
-    """חלוקת כותרת לעמודת 'נושא' / 'תת־נושא' גם ללא מפריד '–' ברור."""
     s = str(label).strip()
     if not s:
         return []
-    # 1) נסה מפרידים מוכרים
     for d in DELIMS:
         if d in s:
             parts = [p.strip() for p in s.split(d) if p.strip()]
             if parts:
                 return parts
-    # 2) חתוך לפני שנה אם קיימת
     m = YEAR_RE.search(s)
     if m:
         s = s[:m.start()].strip()
-    # 3) ניקוי סוגריים ורווחים
     s = re.sub(r"\([^)]*\)", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # 4) שתי מילים ראשונות כנושא, השאר תת־נושא
     words = HE_WORDS.findall(s)
     if not words:
         return [label]
@@ -113,94 +105,7 @@ def columns_for_selection(topic_index, topic, subtopic):
         return out
     return topic_index.get(topic, {}).get(subtopic, [])
 
-def format_number(x):
-    if pd.isna(x):
-        return "—"
-    try:
-        if abs(x) >= 1000:
-            return f"{x:,.0f}"
-        return f"{x:,.2f}"
-    except Exception:
-        return str(x)
-
-# ========================
-# Robust loaders
-# ========================
-@st.cache_data
-def load_data(data_path: Path):
-    """
-    טוען נתונים בפורמט JSON / NDJSON / CSV באופן עמיד.
-    מכריח עמודת שם רשות ל-'שם רשות' וממיר עמודות מספריות (אם ≥50% ניתנות להמרה).
-    """
-    if not data_path.exists():
-        st.error("לא נמצא קובץ נתונים: negev_data.json (או שהשם/המיקום שגוי).")
-        st.stop()
-
-    df = None
-    # --- CSV ---
-    if data_path.suffix.lower() == ".csv":
-        try:
-            df = pd.read_csv(data_path, encoding="utf-8-sig")
-        except Exception:
-            df = pd.read_csv(data_path, encoding="utf-8")
-
-    # --- JSON סטנדרטי ---
-    if df is None:
-        try:
-            df = pd.read_json(data_path)
-        except Exception:
-            df = None
-
-    # --- NDJSON (שורה=אובייקט) ---
-    if df is None:
-        try:
-            df = pd.read_json(data_path, orient="records", lines=True)
-        except Exception:
-            df = None
-
-    # --- JSON עטוף במפתח data/records/items/rows ---
-    if df is None:
-        try:
-            raw = data_path.read_text(encoding="utf-8")
-        except Exception:
-            raw = data_path.read_text(encoding="utf-8-sig")
-        try:
-            j = json.loads(raw)
-            if isinstance(j, dict):
-                for key in ("data", "records", "items", "rows"):
-                    if key in j and isinstance(j[key], list):
-                        df = pd.DataFrame(j[key])
-                        break
-            elif isinstance(j, list):
-                df = pd.DataFrame(j)
-        except Exception:
-            df = None
-
-    if df is None:
-        try:
-            head = data_path.read_text(encoding="utf-8")[:400]
-        except Exception:
-            head = "(לא ניתן לקרוא טקסט כ-UTF-8)"
-        st.error("פורמט הנתונים לא זוהה כ-JSON/NDJSON/CSV. בדוק שהקובץ הוא JSON תקין (רשימה של אובייקטים) או CSV.")
-        st.code(head)
-        st.stop()
-
-    df.columns = make_unique_columns(df.columns)
-
-    # זיהוי עמודת שם רשות
-    name_col = None
-    for c in df.columns:
-        if c in POSSIBLE_NAME_COLS:
-            name_col = c
-            break
-    if name_col is None:
-        name_col = df.columns[0]
-
-    df[name_col] = df[name_col].astype(str).str.strip()
-    if name_col != "שם רשות":
-        df = df.rename(columns={name_col: "שם רשות"})
-
-    # המרה נומרית (אם ≥50% ניתנות להמרה)
+def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         if c == "שם רשות":
             continue
@@ -218,7 +123,145 @@ def load_data(data_path: Path):
                 df[c] = conv
         except Exception:
             pass
+    return df
 
+def _normalize_name_col(df: pd.DataFrame) -> pd.DataFrame:
+    name_col = None
+    for c in df.columns:
+        if c in POSSIBLE_NAME_COLS:
+            name_col = c
+            break
+    if name_col is None:
+        name_col = df.columns[0]
+    df[name_col] = df[name_col].astype(str).str.strip()
+    if name_col != "שם רשות":
+        df = df.rename(columns={name_col: "שם רשות"})
+    return df
+
+# ========================
+# Robust loaders (file path or uploaded file)
+# ========================
+@st.cache_data
+def load_from_bytes(data: bytes, filename: str, sheet: str|int|None):
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    df = None
+
+    # CSV
+    if ext in ("csv",):
+        for enc in ("utf-8-sig", "utf-8", "cp1255"):
+            try:
+                df = pd.read_csv(io.BytesIO(data), encoding=enc)
+                break
+            except Exception:
+                continue
+
+    # Excel
+    if df is None and ext in ("xlsx", "xls"):
+        try:
+            xl = pd.ExcelFile(io.BytesIO(data))
+            use_sheet = sheet if sheet is not None else xl.sheet_names[0]
+            df = xl.parse(use_sheet)
+        except Exception as e:
+            raise RuntimeError(f"שגיאה בקריאת Excel: {e}")
+
+    # JSON / NDJSON
+    if df is None and ext in ("json", "ndjson"):
+        txt = None
+        for enc in ("utf-8", "utf-8-sig"):
+            try:
+                txt = io.BytesIO(data).read().decode(enc)
+                break
+            except Exception:
+                continue
+        if txt is None:
+            raise RuntimeError("לא הצלחתי לפענח את קובץ ה-JSON (קידוד תווים).")
+
+        # JSON רגיל
+        try:
+            df = pd.read_json(io.StringIO(txt))
+        except Exception:
+            pass
+
+        # NDJSON
+        if df is None:
+            try:
+                df = pd.read_json(io.StringIO(txt), orient="records", lines=True)
+            except Exception:
+                pass
+
+        # עטוף במפתח
+        if df is None:
+            try:
+                j = json.loads(txt)
+                if isinstance(j, dict):
+                    for key in ("data", "records", "items", "rows"):
+                        if key in j and isinstance(j[key], list):
+                            df = pd.DataFrame(j[key]); break
+                elif isinstance(j, list):
+                    df = pd.DataFrame(j)
+            except Exception:
+                pass
+
+    if df is None:
+        head = (txt[:400] if isinstance(txt, str) else str(data[:200])) if "txt" in locals() else str(data[:200])
+        raise RuntimeError("פורמט הנתונים לא זוהה כ-CSV/JSON/NDJSON/Excel.\nתצוגה מקדימה:\n" + head)
+
+    df.columns = make_unique_columns(df.columns)
+    df = _normalize_name_col(df)
+    df = _coerce_numeric(df)
+    numeric_cols = [c for c in df.columns if c != "שם רשות" and pd.api.types.is_numeric_dtype(df[c])]
+    return df, numeric_cols
+
+@st.cache_data
+def load_from_repo(data_path: Path, sheet: str|int|None):
+    if not data_path.exists():
+        raise FileNotFoundError("לא נמצא קובץ נתונים בריפו.")
+    suffix = data_path.suffix.lower()
+    if suffix in (".csv",):
+        for enc in ("utf-8-sig","utf-8","cp1255"):
+            try:
+                df = pd.read_csv(data_path, encoding=enc); break
+            except Exception: continue
+    elif suffix in (".xlsx",".xls"):
+        try:
+            df = pd.read_excel(data_path, sheet_name=sheet or 0)
+        except Exception as e:
+            raise RuntimeError(f"שגיאה בקריאת Excel: {e}")
+    else:  # JSON/NDJSON or unknown
+        df = None
+        try:
+            df = pd.read_json(data_path)
+        except Exception:
+            pass
+        if df is None:
+            try:
+                df = pd.read_json(data_path, orient="records", lines=True)
+            except Exception:
+                pass
+        if df is None:
+            try:
+                raw = data_path.read_text(encoding="utf-8")
+            except Exception:
+                raw = data_path.read_text(encoding="utf-8-sig")
+            try:
+                j = json.loads(raw)
+                if isinstance(j, dict):
+                    for key in ("data","records","items","rows"):
+                        if key in j and isinstance(j[key], list):
+                            df = pd.DataFrame(j[key]); break
+                elif isinstance(j, list):
+                    df = pd.DataFrame(j)
+            except Exception:
+                pass
+        if df is None:
+            head = ""
+            try: head = data_path.read_text(encoding="utf-8")[:400]
+            except Exception: head = "(לא ניתן לקרוא כ-UTF-8)"
+            raise RuntimeError("פורמט הנתונים לא זוהה כ-CSV/JSON/NDJSON/Excel.\nתצוגה מקדימה:\n"+head)
+
+    df.columns = make_unique_columns(df.columns)
+    df = _normalize_name_col(df)
+    df = _coerce_numeric(df)
     numeric_cols = [c for c in df.columns if c != "שם רשות" and pd.api.types.is_numeric_dtype(df[c])]
     return df, numeric_cols
 
@@ -246,7 +289,6 @@ def load_geojson(candidates):
 
 @st.cache_data
 def detect_geo_name_key(geojson, authority_names):
-    """ניסיון לזהות את מפתח שם הרשות בעברית ב-GeoJSON (כדי להתאים ל'שם רשות')."""
     if geojson is None:
         return None
     candidates = ["שם רשות","שם הרשות","name","NAME","Muni_Heb","HEB_NAME","heb_name","muni_name","MUN_HEB"]
@@ -261,11 +303,33 @@ def detect_geo_name_key(geojson, authority_names):
     return None
 
 # ========================
+# Sidebar: upload/choose data
+# ========================
+with st.sidebar:
+    st.markdown('<div class="rtl"><h3>טעינת נתונים</h3></div>', unsafe_allow_html=True)
+    up = st.file_uploader("העלה קובץ נתונים (CSV / JSON / NDJSON / Excel)", type=["csv","json","ndjson","xlsx","xls"])
+    excel_sheet = None
+    if up is not None and up.name.lower().endswith((".xlsx",".xls")):
+        try:
+            xl = pd.ExcelFile(up)
+            excel_sheet = st.selectbox("בחר/י גיליון (Excel):", xl.sheet_names, index=0)
+        except Exception:
+            st.info("לא הצלחתי לקרוא את שמות הגיליונות; אנסה את הגיליון הראשון.")
+
+# ========================
 # Load data
 # ========================
-df, numeric_cols = load_data(DATA_FILE)
-negev31 = load_authorities(AUTH_FILE)
+try:
+    if up is not None:
+        df, numeric_cols = load_from_bytes(up.getvalue(), up.name, excel_sheet)
+    else:
+        # אם אין העלאה – נטען מהקובץ שבריפו (תומך גם Excel/CSV/JSON)
+        df, numeric_cols = load_from_repo(DATA_FILE, sheet=None)
+except Exception as e:
+    st.error(str(e))
+    st.stop()
 
+negev31 = load_authorities(AUTH_FILE)
 df_negev = df[df["שם רשות"].isin(negev31)].copy() if negev31 else df.copy()
 df_negev.columns = make_unique_columns(df_negev.columns)
 
@@ -273,10 +337,10 @@ topic_index = build_topic_index(df_negev.columns)
 topics = sorted([t for t in topic_index.keys() if t])
 
 # ========================
-# Sidebar
+# Controls
 # ========================
 with st.sidebar:
-    st.markdown('<div class="rtl"><h3>הגדרות</h3></div>', unsafe_allow_html=True)
+    st.markdown('<div class="rtl"><h3>הגדרות תצוגה</h3></div>', unsafe_allow_html=True)
 
     default_authorities = negev31[:2] if len(negev31) >= 2 else sorted(df_negev["שם רשות"].unique().tolist())[:2]
     authorities = st.multiselect(
@@ -287,7 +351,7 @@ with st.sidebar:
     )
 
     if not topics:
-        st.error("לא זוהו נושאים. ודא ש־negev_data.json מכיל שמות עמודות קריאים.")
+        st.error("לא זוהו נושאים. ודא ששמות העמודות ברורות (גם בלי מפריד – ההיוריסטיקה תזהה).")
         st.stop()
 
     topic = st.selectbox("נושא:", options=topics)
@@ -303,7 +367,6 @@ with st.sidebar:
         index=0 if numeric_in_topic else None
     )
 
-    # טבלת הנושא - בחירת עמודות (דיפולט עד 12)
     default_cols = topic_cols[: min(12, len(topic_cols))]
     secondary_metrics = st.multiselect(
         "עמודות להצגה בטבלת הנושא:",
@@ -330,19 +393,11 @@ with tab_overview:
         f'<div class="rtl"><h2>סקירה — {topic}{" · "+subtopic if subtopic and subtopic!="(הכול)" else ""}</h2></div>',
         unsafe_allow_html=True
     )
-
-    # KPIs
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown(
-            f'<div class="kpi"><h3>מס׳ רשויות</h3><div class="val">{df_negev["שם רשות"].nunique()}</div></div>',
-            unsafe_allow_html=True
-        )
+        st.markdown(f'<div class="kpi"><h3>מס׳ רשויות</h3><div class="val">{df_negev["שם רשות"].nunique()}</div></div>', unsafe_allow_html=True)
     with c2:
-        st.markdown(
-            f'<div class="kpi"><h3>מס׳ מדדים בנושא</h3><div class="val">{len(topic_cols)}</div></div>',
-            unsafe_allow_html=True
-        )
+        st.markdown(f'<div class="kpi"><h3>מס׳ מדדים בנושא</h3><div class="val">{len(topic_cols)}</div></div>', unsafe_allow_html=True)
     with c3:
         if isinstance(selected_metric, str) and selected_metric in df_negev.columns:
             mu = df_negev[selected_metric].dropna().mean()
@@ -361,7 +416,6 @@ with tab_overview:
         else:
             st.markdown('<div class="kpi"><h3>חוסר נתונים~%</h3><div class="val">—</div></div>', unsafe_allow_html=True)
 
-    # התפלגות המדד המרכזי
     if isinstance(selected_metric, str) and selected_metric in df_negev.columns and pd.api.types.is_numeric_dtype(df_negev[selected_metric]):
         fig = px.histogram(df_negev, x=selected_metric, nbins=20, title="התפלגות המדד בכלל רשויות הנגב")
         st.plotly_chart(fig, use_container_width=True)
@@ -384,25 +438,17 @@ with tab_ranking:
             file_name=f"negev_topic_{topic.replace(' ','_')}.csv",
             mime="text/csv"
         )
-
-    # בר השוואה מהירה
     if authorities and isinstance(selected_metric, str) and selected_metric in df_negev.columns:
         cmp = df_negev[df_negev["שם רשות"].isin(authorities)][["שם רשות", selected_metric]].dropna()
         if not cmp.empty:
-            fig2 = px.bar(
-                cmp, x="שם רשות", y=selected_metric, text=selected_metric,
-                title=f"השוואת {selected_metric} לרשויות שנבחרו"
-            )
+            fig2 = px.bar(cmp, x="שם רשות", y=selected_metric, text=selected_metric, title=f"השוואת {selected_metric} לרשויות שנבחרו")
             fig2.update_traces(texttemplate="%{text:.2f}", textposition="outside")
             fig2.update_layout(xaxis_title="", yaxis_title="")
             st.plotly_chart(fig2, use_container_width=True)
 
 # ---- מפה ----
 with tab_map:
-    st.markdown(
-        f'<div class="rtl"><h2>מפה – {topic}{" · "+subtopic if subtopic and subtopic!="(הכול)" else ""}</h2></div>',
-        unsafe_allow_html=True
-    )
+    st.markdown(f'<div class="rtl"><h2>מפה – {topic}{" · "+subtopic if subtopic and subtopic!="(הכול)" else ""}</h2></div>', unsafe_allow_html=True)
     geojson, geo_name = load_geojson(GEO_FILE_CANDIDATES)
     if geojson is None:
         st.info("לא נמצא קובץ GeoJSON (לדוגמה: negev_geo.json). העלה/י קובץ מפה כדי לאפשר כלורופלת.")
@@ -414,12 +460,8 @@ with tab_map:
             st.warning("לא הצלחתי להתאים בין שמות הרשויות בקובץ הנתונים לתכונות ה-GeoJSON. ודא/י שקיים שדה תכונה תואם (למשל 'שם רשות').")
         else:
             figm = px.choropleth(
-                df_negev,
-                geojson=geojson,
-                featureidkey=f"properties.{key}",
-                locations="שם רשות",
-                color=selected_metric,
-                color_continuous_scale="Viridis",
+                df_negev, geojson=geojson, featureidkey=f"properties.{key}",
+                locations="שם רשות", color=selected_metric, color_continuous_scale="Viridis",
                 title=f"מפה – {selected_metric}"
             )
             figm.update_geos(fitbounds="locations", visible=False)
@@ -436,10 +478,7 @@ with tab_explore:
         y_col = c2.selectbox("ציר Y (מספרי):", options=[c for c in numeric_in_topic if c != x_col], index=0)
         scat = df_negev[["שם רשות", x_col, y_col]].dropna()
         if not scat.empty:
-            fig = px.scatter(
-                scat, x=x_col, y=y_col, text="שם רשות",
-                trendline=None, title=f"פיזור: {y_col} ~ {x_col}"
-            )
+            fig = px.scatter(scat, x=x_col, y=y_col, text="שם רשות", trendline=None, title=f"פיזור: {y_col} ~ {x_col}")
             fig.update_traces(textposition="top center")
             st.plotly_chart(fig, use_container_width=True)
     else:
